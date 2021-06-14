@@ -1485,6 +1485,16 @@
 			};
 		};
 
+		wifi: qcom,wifi {
+			compatible = "qcom,qca6x90-wifi";
+			qcom,6x90_sku_version = <2>;
+			wlan-en-gpio = <&tlmm 20 0>;
+			pinctrl-names = "wlan_en_active", "wlan_en_sleep";
+			pinctrl-0 = <&wlan_en_active>;
+			pinctrl-1 = <&wlan_en_sleep>;
+			status = "disabled";
+		};
+
 		ufs_mem_hc: ufshc@1d84000 {
 			compatible = "qcom,sm8250-ufshc", "qcom,ufshc",
 				     "jedec,ufs-2.0";
@@ -3393,6 +3403,34 @@
 					function = "mi2s2_ws";
 					drive-strength = <8>;
 					output-high;
+				};
+			};
+
+			wlan_en_active: wlan_en_active {
+				mux {
+					pins = "gpio20";
+					function = "gpio";
+				};
+
+				config {
+					pins = "gpio20";
+					drive-strength = <16>;
+					output-high;
+					bias-pull-up;
+				};
+			};
+
+			wlan_en_sleep: wlan_en_sleep {
+				mux {
+					pins = "gpio20";
+					function = "gpio";
+				};
+
+				config {
+					pins = "gpio20";
+					drive-strength = <2>;
+					output-low;
+					bias-pull-down;
 				};
 			};
 		};
