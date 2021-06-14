@@ -6,6 +6,11 @@
 #include <linux/module.h>
 #include <linux/msi.h>
 #include <linux/pci.h>
+#ifdef CONFIG_ARCH_QCOM
+#include <linux/of_device.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/regulator/consumer.h>
+#endif
 
 #include "pci.h"
 #include "core.h"
@@ -74,7 +79,49 @@ static const struct ath11k_msi_config ath11k_msi_config[] = {
 	},
 };
 
-static const char *irq_name[ATH11K_IRQ_NUM_MAX] = {
+#ifdef CONFIG_ARCH_QCOM
+#define ATH11K_WLAN_EN_ACTIVE			"wlan_en_active"
+#define ATH11K_WLAN_EN_SLEEP			"wlan_en_sleep"
+
+static const char *ath11k_regulators_sku1[] = {
+	"vdd-wlan-ctrl1",
+	"vdd-wlan-ctrl2",
+	"vdd-wlan-core_vl",
+	"vdd-wlan-core_vm",
+	"vdd-wlan-core_vh",
+	"vdd-wlan-vdd_io"
+};
+
+static const char *ath11k_regulators_sku2[] = {
+	"vdd-wlan-aon",
+	"vdd-wlan-io",
+	"vdd-wlan-rfa1",
+	"vdd-wlan-rfa2",
+	"vdd-wlan-dig",
+	"vdd-wlan-ant-switch"
+};
+
+enum ath11k_qca6x90_sku {
+	ATH11K_HW_QCA6X90_SKU1 = 1,
+	ATH11K_HW_QCA6X90_SKU2,
+};
+
+static struct ath11k_platform_config {
+	struct regulator_bulk_data *vregs;
+	size_t num_vregs;
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *wlan_en_active;
+	struct pinctrl_state *wlan_en_sleep;
+} plat_cfg;
+
+static const struct of_device_id ath11k_platform_of_match[] = {
+	{ .compatible = "qcom,qca6x90-wifi",
+	},
+	{ }
+};
+#endif
+
+const char *irq_name[ATH11K_IRQ_NUM_MAX] = {
 	"bhi",
 	"mhi-er0",
 	"mhi-er1",
@@ -1191,6 +1238,10 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
 		return -ENOMEM;
 	}
 
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "pci probe %04x:%04x %04x:%04x\n",
+		   pdev->vendor, pdev->device,
+		   pdev->subsystem_vendor, pdev->subsystem_device);
+
 	ab->dev = &pdev->dev;
 	pci_set_drvdata(pdev, ab);
 	ab_pci = ath11k_pci_priv(ab);
@@ -1319,6 +1370,7 @@ static void ath11k_pci_remove(struct pci_dev *pdev)
 		goto qmi_fail;
 	}
 
+	ath11k_dbg(ab, ATH11K_DBG_PCI, "pci remove\n");
 	set_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags);
 
 	ath11k_core_deinit(ab);
@@ -1381,7 +1433,180 @@ static struct pci_driver ath11k_pci_driver = {
 #endif
 };
 
-static int ath11k_pci_init(void)
+#ifdef CONFIG_ARCH_QCOM
+static int ath11k_get_platform_config(struct platform_device *pdev)
+{
+	const char **regulator_cfg;
+	int i, ret;
+	u32 sku;
+
+	ret = device_property_read_u32(&pdev->dev, "qcom,6x90_sku_version",
+				       &sku);
+	if (ret) {
+		pr_err("6x90_sku_version property not found: %d\n", ret);
+		return -EINVAL;
+	}
+
+	switch (sku) {
+	case ATH11K_HW_QCA6X90_SKU1:
+		plat_cfg.num_vregs = ARRAY_SIZE(ath11k_regulators_sku1);
+		regulator_cfg = ath11k_regulators_sku1;
+		break;
+	case ATH11K_HW_QCA6X90_SKU2:
+		plat_cfg.num_vregs = ARRAY_SIZE(ath11k_regulators_sku2);
+		regulator_cfg = ath11k_regulators_sku2;
+		break;
+	}
+
+	plat_cfg.vregs = devm_kcalloc(&pdev->dev, plat_cfg.num_vregs,
+				      sizeof(*plat_cfg.vregs), GFP_KERNEL);
+	if (!plat_cfg.vregs)
+		return -ENOMEM;
+
+	for (i = 0; i < plat_cfg.num_vregs; i++)
+		plat_cfg.vregs[i].supply = regulator_cfg[i];
+
+	ret = devm_regulator_bulk_get(&pdev->dev, plat_cfg.num_vregs,
+				      plat_cfg.vregs);
+
+	plat_cfg.pinctrl = devm_pinctrl_get(&pdev->dev);
+	if (IS_ERR_OR_NULL(plat_cfg.pinctrl)) {
+		ret = PTR_ERR(plat_cfg.pinctrl);
+		pr_err("failed to get pinctrl: %d\n", ret);
+		goto out;
+	}
+
+	plat_cfg.wlan_en_active =
+		pinctrl_lookup_state(plat_cfg.pinctrl,
+				     ATH11K_WLAN_EN_ACTIVE);
+	if (IS_ERR_OR_NULL(plat_cfg.wlan_en_active)) {
+		ret = PTR_ERR(plat_cfg.wlan_en_active);
+		pr_err("failed to get wlan_en active state: %d\n",
+		       ret);
+		goto out;
+	}
+
+	plat_cfg.wlan_en_sleep =
+		pinctrl_lookup_state(plat_cfg.pinctrl,
+				     ATH11K_WLAN_EN_SLEEP);
+	if (IS_ERR_OR_NULL(plat_cfg.wlan_en_sleep)) {
+		ret = PTR_ERR(plat_cfg.wlan_en_sleep);
+		pr_err("failed to get wlan_en sleep state: %d\n",
+		       ret);
+		goto out;
+	}
+
+	return 0;
+
+out:
+	return ret;
+}
+
+static int ath11k_chip_poweron(struct platform_device *pdev)
+{
+	int ret;
+
+	pr_info("ath11k soc power on\n");
+
+	ret = regulator_bulk_enable(plat_cfg.num_vregs, plat_cfg.vregs);
+	if (ret)
+		pr_err("failed to enable vreg\n");
+
+	ret = pinctrl_select_state(plat_cfg.pinctrl,
+				   plat_cfg.wlan_en_active);
+	if (ret) {
+		pr_err("failed to select wlan_en active state: %d\n",
+		       ret);
+		goto out;
+	}
+
+	return 0;
+out:
+	regulator_bulk_disable(plat_cfg.num_vregs, plat_cfg.vregs);
+	return ret;
+}
+
+static int ath11k_chip_poweroff(struct platform_device *pdev)
+{
+	int ret;
+
+	pr_info("ath11k soc power off\n");
+
+	ret = pinctrl_select_state(plat_cfg.pinctrl,
+				   plat_cfg.wlan_en_sleep);
+	if (ret)
+		pr_err("failed to select wlan_en active state: %d\n",
+		       ret);
+
+	ret = regulator_bulk_disable(plat_cfg.num_vregs, plat_cfg.vregs);
+	if (ret)
+		pr_err("failed to enable vreg\n");
+
+	return ret;
+}
+
+static int ath11k_platform_probe(struct platform_device *pdev)
+{
+	int ret;
+
+	ret = ath11k_get_platform_config(pdev);
+	if (ret) {
+		pr_err("failed to get platform config: %d\n", ret);
+		goto  out;
+	}
+
+	ret = ath11k_chip_poweron(pdev);
+	if (ret) {
+		pr_err("failed to get power on device: %d\n", ret);
+		goto  out;
+	}
+
+	ret = pci_register_driver(&ath11k_pci_driver);
+	if (ret) {
+		pr_err("failed to register ath11k pci driver: %d\n",
+		       ret);
+		goto power_off;
+	}
+
+	return 0;
+
+power_off:
+	ath11k_chip_poweroff(pdev);
+
+out:
+	return ret;
+}
+
+static int ath11k_platform_remove(struct platform_device *pdev)
+{
+	pci_unregister_driver(&ath11k_pci_driver);
+	ath11k_chip_poweroff(pdev);
+
+	return 0;
+}
+
+static struct platform_driver ath11k_platform_driver = {
+	.probe  = ath11k_platform_probe,
+	.remove = ath11k_platform_remove,
+	.driver = {
+		.name  = "ath11k_msm",
+		.of_match_table = ath11k_platform_of_match,
+	},
+};
+
+int ath11k_platform_init(void)
+{
+	return platform_driver_register(&ath11k_platform_driver);
+}
+module_init(ath11k_platform_init);
+
+void ath11k_platform_exit(void)
+{
+	platform_driver_unregister(&ath11k_platform_driver);
+}
+module_exit(ath11k_platform_exit);
+#else
+int ath11k_pci_init(void)
 {
 	int ret;
 
@@ -1392,14 +1617,14 @@ static int ath11k_pci_init(void)
 
 	return ret;
 }
-module_init(ath11k_pci_init);
 
-static void ath11k_pci_exit(void)
+void ath11k_pci_exit(void)
 {
 	pci_unregister_driver(&ath11k_pci_driver);
 }
-
+module_init(ath11k_pci_init);
 module_exit(ath11k_pci_exit);
+#endif
 
 MODULE_DESCRIPTION("Driver support for Qualcomm Technologies 802.11ax WLAN PCIe devices");
 MODULE_LICENSE("Dual BSD/GPL");
